@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"time"
 
@@ -19,6 +18,13 @@ import (
 	"github.com/testground/sdk-go/run"
 	"github.com/testground/sdk-go/runtime"
 	"github.com/testground/sdk-go/sync"
+
+	flag "github.com/spf13/pflag"
+
+	"go.vocdoni.io/dvote/crypto/ethereum"
+	"go.vocdoni.io/dvote/data"
+	"go.vocdoni.io/dvote/ipfssync"
+	"go.vocdoni.io/dvote/log"
 )
 
 type region int
@@ -73,19 +79,107 @@ func routeFilter(action network.FilterAction) run.TestCaseFn {
 		netclient := network.NewClient(client, runenv)
 		netclient.MustWaitNetworkInitialized(ctx)
 
-		// Each node starts an HTTP server to test for connectivity
-		runenv.RecordMessage("Starting http server")
-		http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-			runenv.RecordMessage("received http request from %s", req.RemoteAddr)
-			fmt.Fprintln(w, "hello.")
-		})
-		go func() { _ = http.ListenAndServe(":8765", nil) }()
+		// Start ipfsSync node
+		runenv.RecordMessage("Starting ipfsSync node")
+
+		home, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatal(err)
+		}
+		userDir := home + "/.ipfs"
+		logLevel := flag.String("logLevel", "info", "log level")
+		dataDir := flag.String("dataDir", userDir, "directory for storing data")
+		key := flag.String("key", "vocdoni", "secret shared group key for the sync cluster")
+		nodeKey := flag.String("nodeKey", "", "custom private hexadecimal 256 bit key for p2p identity")
+		port := flag.Int16("port", 4171, "port for the sync network")
+		helloInterval := flag.Int("helloInterval", 40, "period in seconds for sending hello messages")
+		updateInterval := flag.Int("updateInterval", 20, "period in seconds for sending update messages")
+		peers := flag.StringArray("peers", []string{},
+			"custom list of peers to connect to (multiaddresses separated by commas)")
+		private := flag.Bool("private", false,
+			"if enabled a private libp2p network will be created (using the secret key at transport layer)")
+		bootnodes := flag.StringArray("bootnodes", []string{},
+			"list of bootnodes (multiaddress separated by commas)")
+		bootnode := flag.Bool("bootnode", false,
+			"act as a bootstrap node (will not try to connect with other bootnodes)")
+
+		flag.CommandLine.SortFlags = false
+		flag.Parse()
+
+		log.Init(*logLevel, "stdout")
+		ipfsStore := data.IPFSNewConfig(*dataDir)
+		storage, err := data.Init(data.StorageIDFromString("IPFS"), ipfsStore)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		sk := ethereum.NewSignKeys()
+		var privKey string
+
+		if len(*nodeKey) > 0 {
+			if err := sk.AddHexKey(*nodeKey); err != nil {
+				log.Fatal(err)
+			}
+			_, privKey = sk.HexString()
+		} else {
+			pk := make([]byte, 64)
+			kfile, err := os.OpenFile(*dataDir+"/.ipfsSync.key", os.O_CREATE|os.O_RDWR, 0o600)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			if n, err := kfile.Read(pk); err != nil || n == 0 {
+				log.Info("generating new node private key")
+				if err := sk.Generate(); err != nil {
+					log.Fatal(err)
+				}
+				_, privKey = sk.HexString()
+				if _, err := kfile.WriteString(privKey); err != nil {
+					log.Fatal(err)
+				}
+			} else {
+				log.Info("loaded saved node private key")
+				if err := sk.AddHexKey(string(pk)); err != nil {
+					log.Fatal(err)
+				}
+				_, privKey = sk.HexString()
+			}
+			if err := kfile.Close(); err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		p2pType := "libp2p"
+		if *private {
+			p2pType = "privlibp2p"
+		}
+
+		is := ipfssync.NewIPFSsync(*dataDir, *key, privKey, p2pType, storage)
+		is.HelloInterval = time.Second * time.Duration(*helloInterval)
+		is.UpdateInterval = time.Second * time.Duration(*updateInterval)
+		is.Port = *port
+		if *bootnode {
+			is.Bootnodes = []string{""}
+		} else {
+			is.Bootnodes = *bootnodes
+		}
+		is.Start()
+		for _, peer := range *peers {
+			time.Sleep(2 * time.Second)
+			log.Infof("connecting to peer %s", peer)
+			if err := is.Transport.AddPeer(peer); err != nil {
+				log.Warnf("cannot connect to custom peer: (%s)", err)
+			}
+		}
 
 		// Race to signal this point, the sequence ID determines to which region this node belongs.
 		seq := client.MustSignalEntry(ctx, "region-select")
 		ip := netclient.MustGetDataNetworkIP()
 		me := node{region(int(seq) % 3), &ip}
 		runenv.RecordMessage("my ip is %s and I am in region %s", ip, me.Region)
+
+		// instead of blocking forever, sleep for a minute
+		time.Sleep(time.Minute)
 
 		// publish my address so other nodes know how to reach me.
 		nodeTopic := sync.NewTopic("nodes", node{})
@@ -144,43 +238,9 @@ func routeFilter(action network.FilterAction) run.TestCaseFn {
 		// The http doesn't start instantly, just hang on a sec.
 		time.Sleep(10 * time.Second)
 
-		var unexpected error
-		var errs int
-		var status200 int
-		var total int
-
-		// Try to reach out to each node and see what happens.
-		httpclient := http.Client{
-			Timeout: time.Minute,
-		}
-
-		// When running the "accept" testcase, there should be no failures.
-		// For the others, region A cannot reacon region B, so we expect failures.
-		for _, p := range nodes {
-			total++
-			remoteAddr := "http://" + p.IP.String() + ":8765"
-			runenv.RecordMessage("(region %s) contacting %s", me.Region, remoteAddr)
-			resp, err := httpclient.Get(remoteAddr)
-			if err != nil {
-				errs++
-				if !expectErrors(runenv, &me, p) {
-					runenv.RecordFailure(err)
-					unexpected = err
-				}
-				continue
-			}
-			if resp.StatusCode == 200 {
-				status200++
-			}
-		}
-
-		runenv.RecordMessage("could not connect %d", errs)
-		runenv.RecordMessage("200 status codes %d", status200)
-		runenv.RecordMessage("total, %d", total)
-
 		client.MustSignalAndWait(ctx, "testcomplete", runenv.TestInstanceCount)
 
 		client.Close()
-		return unexpected
+		return nil
 	}
 }
