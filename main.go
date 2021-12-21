@@ -81,6 +81,24 @@ func routeFilter(action network.FilterAction) run.TestCaseFn {
 		netclient := network.NewClient(client, runenv)
 		netclient.MustWaitNetworkInitialized(ctx)
 
+		config := &network.Config{
+			// Control the "default" network. At the moment, this is the only network.
+			Network: "default",
+
+			// Enable this network. Setting this to false will disconnect this test
+			// instance from this network. You probably don't want to do that.
+			Enable: true,
+			Default: network.LinkShape{
+				Latency:   100 * time.Millisecond,
+				Bandwidth: 1 << 20, // 1Mib
+			},
+			CallbackState: "network-configured",
+			RoutingPolicy: network.AllowAll,
+		}
+
+		runenv.RecordMessage("before netclient.MustConfigureNetwork")
+		netclient.MustConfigureNetwork(ctx, config)
+
 		// Start ipfsSync node
 		runenv.RecordMessage("Starting ipfsSync node")
 
