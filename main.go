@@ -35,6 +35,8 @@ const (
 	regionC
 )
 
+const RunDuration = 5 * time.Minute
+
 func (r region) String() string {
 	return [...]string{"region_A", "region_B", "region_C"}[r]
 }
@@ -67,7 +69,7 @@ func routeFilter(action network.FilterAction) run.TestCaseFn {
 
 	return func(runenv *runtime.RunEnv) error {
 
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), RunDuration+300*time.Second)
 		defer cancel()
 
 		client := sync.MustBoundClient(ctx, runenv)
@@ -178,8 +180,8 @@ func routeFilter(action network.FilterAction) run.TestCaseFn {
 		me := node{region(int(seq) % 3), &ip}
 		runenv.RecordMessage("my ip is %s and I am in region %s", ip, me.Region)
 
-		// instead of blocking forever, sleep for a minute
-		time.Sleep(time.Minute)
+		// instead of blocking forever, sleep for RunDuration
+		time.Sleep(RunDuration)
 
 		// publish my address so other nodes know how to reach me.
 		nodeTopic := sync.NewTopic("nodes", node{})
